@@ -1,22 +1,48 @@
-type Var = String;
+use std::rc::Rc;
+use std::cell::RefCell;
+
+type Var = &'static str;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Expr {
-    Lit(i32),
-    Add(Box<Expr>, Box<Expr>),
-    Mul(Box<Expr>, Box<Expr>),
+    NumLit(i32),
+    UnaryOp(UnaryOp, Box<Expr>),
+    BinOp(BinOp, Box<Expr>, Box<Expr>),
     If(Box<Expr>, Box<Expr>, Box<Expr>),
     Var(Var),
-    Lam(Var, Box<Expr>),
-    App(Box<Expr>, Box<Expr>)
+    Lam(Var, Box<Expr>, im::HashMap<Var,()>),
+    Rec(Var, Var, Box<Expr>, im::HashMap<Var,()>),
+    App(Box<Expr>, Box<Expr>),
+    Let(Var, Box<Expr>, Box<Expr>),
 }
 
-type Env<'a> = im::HashMap<&'a Var, Val<'a>>;
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum UnaryOp {
+    Inc,
+    Dec,
+    Abs,
+    Neg,
+    Not,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    And,
+    Or,
+    Eq,
+}
+
+type Env<'a> = im::HashMap<Var, Val<'a>>;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Val<'a> {
     Num(i32),
-    Closure(&'a Var, &'a Expr, Env<'a>),
+    Bool(bool),
+    Closure(Var, &'a Expr, Rc<RefCell<Env<'a>>>),
 }
 
 pub type Err = String;
@@ -24,28 +50,60 @@ pub type Err = String;
 
 static TYPE_ERROR: &str = "Type Error";
 
+fn free_vars(e: &Expr) -> im::HashMap<Var, ()> {
+    match e {
+        Expr::Var(x)           => im::hashmap!{ *x => () },
+        Expr::NumLit(_)        => im::hashmap!{},
+        Expr::UnaryOp(_, e)    => free_vars(e),
+        Expr::BinOp(_, e1, e2) => free_vars(e1) + free_vars(e2),
+        Expr::If(e1, e2, e3)   => free_vars(e1) + free_vars(e2) + free_vars(e3),
+        Expr::App(e1, e2)      => free_vars(e1) + free_vars(e2),
+        Expr::Lam(x, _, fv)    => fv.without(x),
+        Expr::Rec(f, x, _, fv) => fv.without(f).without(x),
+        Expr::Let(x, e1, e2)   => free_vars(e1) + free_vars(e2).without(x),
+    }
+}
+
+#[inline(always)]
+fn unop<'a>(op: &UnaryOp, v: Val<'a>) -> Val<'a> {
+    match (op,v) {
+        (UnaryOp::Inc, Val::Num(n))  => Val::Num(n + 1),
+        (UnaryOp::Dec, Val::Num(n))  => Val::Num(n - 1),
+        (UnaryOp::Abs, Val::Num(n))  => Val::Num(n.abs()),
+        (UnaryOp::Neg, Val::Num(n))  => Val::Num(-n),
+        (UnaryOp::Not, Val::Bool(b)) => Val::Bool(!b),
+        (_, _) => panic!("{}", TYPE_ERROR),
+    }
+}
+
+#[inline(always)]
+fn binop<'a>(op: &BinOp, v1: Val<'a>, v2: Val<'a>) -> Val<'a> {
+    match (op,v1,v2) {
+        (BinOp::Add, Val::Num(n1),  Val::Num(n2))  => Val::Num(n1 + n2),
+        (BinOp::Sub, Val::Num(n1),  Val::Num(n2))  => Val::Num(n1 - n2),
+        (BinOp::Mul, Val::Num(n1),  Val::Num(n2))  => Val::Num(n1 * n2),
+        (BinOp::Div, Val::Num(n1),  Val::Num(n2))  => Val::Num(n1 / n2),
+        (BinOp::And, Val::Bool(b1), Val::Bool(b2)) => Val::Bool(b1 && b2),
+        (BinOp::Eq,  Val::Num(n1),  Val::Num(n2))  => Val::Bool(n1 == n2),
+        (_, _, _) => panic!("{}", TYPE_ERROR),
+    }
+}
+
 #[inline(never)]
 pub fn eval<'a>(env: Env<'a>, e: &'a Expr) -> Val<'a> {
     match e {
-        Expr::Lit(n) =>
+        Expr::NumLit(n) =>
             Val::Num(*n),
 
-        Expr::Add(e1, e2) => {
-            let v1 = eval(env.clone(),e1);
-            let v2 = eval(env,e2);
-            match (v1,v2) {
-                (Val::Num(n1), Val::Num(n2)) => Val::Num(n1 + n2),
-                (_, _) => panic!("{}", TYPE_ERROR),
-            }
+        Expr::UnaryOp(op, e1) => {
+            let v = eval(env.clone(),e1);
+            unop(op, v)
         },
 
-        Expr::Mul(e1, e2) => {
+        Expr::BinOp(op, e1, e2) => {
             let v1 = eval(env.clone(),e1);
             let v2 = eval(env,e2);
-            match (v1,v2) {
-                (Val::Num(n1), Val::Num(n2)) => Val::Num(n1 * n2),
-                (_, _) => panic!("{}", TYPE_ERROR),
-            }
+            binop(op, v1, v2)
         },
 
         Expr::If(cond, e1, e2) => {
@@ -63,42 +121,54 @@ pub fn eval<'a>(env: Env<'a>, e: &'a Expr) -> Val<'a> {
                 None => panic!("Variable not in scope"),
             },
 
-        Expr::Lam(x,e) =>
-            Val::Closure(x, e, env),
+        Expr::Lam(x,e,free_vars) => {
+            // remove unused variables from closure
+            let closed_env = env.intersection_with(free_vars.clone(), |v, _| v);
+            Val::Closure(x, e, Rc::new(RefCell::new(closed_env)))
+        },
+
+        Expr::Rec(f, x, e, free_vars) => {
+            let closed_env = Rc::new(RefCell::new(env.intersection_with(free_vars.clone(), |v, _| v)));
+            let v = Val::Closure(x, e, closed_env.clone());
+            closed_env.borrow_mut().insert(f, v.clone());
+            v
+        },
 
         Expr::App(e1, e2) => {
             let cls = eval(env.clone(),e1);
             match cls {
                 Val::Closure(x,e,env_cls) => {
                     let arg = eval(env.clone(),e2);
-                    let new_env = env_cls.update(x, arg);
+                    let new_env = env_cls.borrow().update(x, arg);
                     eval(new_env, &e)
                 },
                 _ => panic!("{}", TYPE_ERROR),
             }
         },
+
+        Expr::Let(_, _, _) => todo!(),
     }
 }
 
 // Smart constructors for expressions
 #[inline(always)]
 pub fn lit(n: i32) -> Expr {
-    Expr::Lit(n)
+    Expr::NumLit(n)
 }
 
 #[inline(always)]
 pub fn add(e1: Expr, e2: Expr) -> Expr {
-    Expr::Add(Box::new(e1), Box::new(e2))
+    Expr::BinOp(BinOp::Add, Box::new(e1), Box::new(e2))
 }
 
 #[inline(always)]
 pub fn mul(e1: Expr, e2: Expr) -> Expr {
-    Expr::Mul(Box::new(e1), Box::new(e2))
+    Expr::BinOp(BinOp::Mul, Box::new(e1), Box::new(e2))
 }
 
 #[inline(always)]
 pub fn dec(e: Expr) -> Expr {
-    Expr::Add(Box::new(e), Box::new(Expr::Lit(-1)))
+    Expr::UnaryOp(UnaryOp::Dec, Box::new(e))
 }
 
 #[inline(always)]
@@ -111,13 +181,14 @@ pub fn if_(cond: Expr, e1: Expr, e2: Expr) -> Expr {
 }
 
 #[inline(always)]
-pub fn var(x: String) -> Expr {
+pub fn var(x: Var) -> Expr {
     Expr::Var(x)
 }
 
 #[inline(always)]
 pub fn lam(x: Var, e: Expr) -> Expr {
-    Expr::Lam(x, Box::new(e))
+    let fv = free_vars(&e);
+    Expr::Lam(x, Box::new(e),fv)
 }
 
 #[inline(always)]
@@ -131,26 +202,12 @@ pub fn let_(x: Var, e1: Expr, e2: Expr) -> Expr {
 }
 
 #[inline(always)]
-pub fn fix(e: Expr) -> Expr {
-    let f = String::from("f");
-    let x = String::from("x");
-    let v = String::from("v");
-    let inner = lam(x.clone(),
-                    app(var(f.clone()),
-                        lam(v.clone(),
-                            app(app(var(x.clone()), var(x.clone())),
-                                var(v)
-                                ))));
-    let fix = lam(f.clone(),
-                  app(inner.clone(), inner));
-    app(fix, e)
+pub fn rec(f: Var, x: Var, e: Expr) -> Expr {
+    let fv = free_vars(&e);
+    Expr::Rec(f, x, Box::new(e), fv)
 }
 
 fn main() {
-    let env = im::HashMap::new();
-    let expr = lit(1);
-    let v = eval(env, &expr);
-    format!("Hello, world! {v:?}");
 }
 
 #[test]
@@ -163,15 +220,14 @@ fn test_eval_arithmetic_expressions() {
 
 #[test]
 fn test_eval_factorial() {
-    let fact = String::from("fact");
-    let x = String::from("x");
-    let factorial = fix(lam(fact.clone(),
-                          lam(x.clone(),
+    let fact = "fact";
+    let x = "x";
+    let factorial = rec(fact.clone(), x.clone(),
                             if_(var(x.clone()),
                                 lit(1),
                                 mul(var(x.clone()), app(var(fact.clone()), dec(var(x.clone()))))
                             )
-                        )));
+                        );
 
     let env = im::HashMap::new();
     let expr = app(factorial, lit(10));
@@ -181,21 +237,19 @@ fn test_eval_factorial() {
 
 #[test]
 fn test_eval_fibonacci() {
-    let fib = String::from("fib");
-    let x = String::from("x");
-    let fibonacci = fix(lam(fib.clone(),
-                            lam(x.clone(),
-                                if_(var(x.clone()),
-                                    lit(0),
-                                    if_(dec(var(x.clone())),
-                                        lit(1),
-                                        add(app(var(fib.clone()), add(var(x.clone()), lit(-1))),
-                                            app(var(fib.clone()), add(var(x.clone()), lit(-2)))
-                                        )
+    let fib = "fib";
+    let x = "x";
+    let fibonacci = rec(fib.clone(), x.clone(),
+                            if_(var(x.clone()),
+                                lit(0),
+                                if_(dec(var(x.clone())),
+                                    lit(1),
+                                    add(app(var(fib.clone()), add(var(x.clone()), lit(-1))),
+                                        app(var(fib.clone()), add(var(x.clone()), lit(-2)))
                                     )
                                 )
                             )
-                        ));
+                        );
 
     let env = im::HashMap::new();
     let expr = app(fibonacci, lit(30));
